@@ -1,0 +1,2 @@
+docker run --rm -e AWS_MAX_ATTEMPTS=90 -e AWS_POLL_DELAY_SECONDS=60 -v C:\Users\luke.powell\.aws:/root/.aws -v C:\Misc\Packer\:/workspace -w /workspace packer-builder:latest build -debug healthroster-build-agent-w2016.json
+pause

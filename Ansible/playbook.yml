@@ -1,0 +1,372 @@
+---
+
+- name: 'Provision Image'
+  hosts: all
+  vars:
+    admin_pw: '{{ admin_pw }}'
+    build_pw: '{{ build_pw }}'
+    build_rld_pw: '{{ build_rld_pw }}'
+    sysprep_pw: '{{ sysprep_pw }}'
+    build_github_pat: '{{ build_github_pat }}'
+
+  tasks:    
+
+    - name: Firewall rule to allow SMB on TCP port 445
+      community.windows.win_firewall_rule:
+        name: SMB
+        localport: 445
+        action: allow
+        direction: in
+        protocol: tcp
+        state: present
+        enabled: yes
+
+    - name: Firewall rule to allow WinRM on TCP port 5985
+      community.windows.win_firewall_rule:
+        name: WinRM
+        localport: 5985
+        action: allow
+        direction: in
+        protocol: tcp
+        state: present
+        enabled: yes
+
+    - name: Set C pagefile, override if exists
+      community.windows.win_pagefile:
+        drive: C
+        initial_size: 4096
+        maximum_size: 4096
+        state: present
+
+    - name: Set UK locales
+      community.windows.win_region:
+        format: en-GB
+        unicode_language: en-GB
+        location: 242
+        copy_settings: yes
+
+    - name: Set timezone to 'GMT Standard Time' (UTC+00:00)
+      community.windows.win_timezone:
+        timezone: GMT Standard Time
+
+    - name: Install all critical and security updates
+      win_updates:
+        category_names:
+        - CriticalUpdates
+        - SecurityUpdates
+        state: installed
+      register: windows_updates
+      
+    - name: Reboot host if required
+      win_reboot:
+      when: windows_updates.reboot_required
+    
+    - name: Install Windows features
+      ansible.windows.win_feature:
+        name:
+          - NET-Framework-Features
+          - NET-Framework-Core
+          - NET-Framework-45-Features
+          - NET-Framework-45-Core
+          - NET-Framework-45-ASPNET
+          - NET-WCF-Services45
+          - NET-WCF-HTTP-Activation45
+          - MSMQ
+          - MSMQ-Services
+          - MSMQ-Multicasting
+          - SMTP-Server
+          - RSAT
+          - RSAT-Feature-Tools
+          - RSAT-SMTP
+          - Web-Common-Http
+          - Web-Default-Doc
+          - Web-Http-Errors
+          - Web-Http-Redirect
+          - Web-Health
+          - Web-Http-Logging
+          - Web-ODBC-Logging
+          - Web-Request-Monitor
+          - Web-Http-Tracing
+          - Web-Performance
+          - Web-Stat-Compression
+          - Web-Dyn-Compression
+          - Web-Security
+          - Web-Filtering
+          - Web-App-Dev
+          - Web-Net-Ext
+          - Web-Net-Ext45
+          - Web-Asp-Net
+          - Web-Asp-Net45
+          - Web-ISAPI-Ext
+          - Web-ISAPI-Filter
+          - Web-Mgmt-Tools
+          - Web-Mgmt-Console
+          - Web-Mgmt-Compat
+          - Web-Scripting-Tools
+      register: win_features
+      
+    - name: Reboot if installing Windows features requires it
+      ansible.windows.win_reboot:
+      when: win_features.reboot_required
+
+    - name: Create local build user
+      ansible.windows.win_user:
+        name: build
+        password: '{{ build_pw }}'
+        password_never_expires: true
+        state: present
+        groups:
+          - Administrators
+
+    - name: Create local sysprep user
+      ansible.windows.win_user:
+        name: sysprep
+        password: '{{ sysprep_pw }}'
+        password_never_expires: true
+        state: present
+        groups:
+          - Administrators
+
+    - name: SQL Server 2019 ISO
+      ansible.windows.win_get_url:
+        url: https://download.microsoft.com/download/7/c/1/7c14e92e-bdcb-4f89-b7cf-93543e7112d1/SQLServer2019-x64-ENU-Dev.iso
+        dest: 'C:\ProvisioningFiles\SQLServer2019-x64-ENU-Dev.iso'
+        url_username: build
+        url_password: '{{ build_pw }}'
+
+    - name: Install SQL Server 2019
+      ansible.windows.win_shell: |
+        Mount-DiskImage -ImagePath C:\ProvisioningFiles\SQLServer2019-x64-ENU-Dev.iso
+        D:\setup.exe /ConfigurationFile=C:\ProvisioningFiles\Prepare.ini
+
+    - name: Install Chocolatey packages with default configuration
+      chocolatey.chocolatey.win_chocolatey:
+        name: 
+          - git
+          - 7zip
+          - notepadplusplus.install
+          - curl
+          - firefox
+          - octopustools
+          - nuget.commandline
+          - devcon.portable
+          - powershell-core
+          - awscli
+          - pstools
+          - openjdk11
+          - sql-server-management-studio
+          - visualstudio2022professional
+
+    - name: Install Chocolatey Visual Studio workloads packages with all optional components argument
+      chocolatey.chocolatey.win_chocolatey:
+        name: 
+          - visualstudio2022-workload-manageddesktop
+          - visualstudio2022-workload-netweb
+          - visualstudio2022-workload-node
+          - visualstudio2022-workload-python
+        package_params: --includeOptional
+
+    - name: Set LOG4J_FORMAT_MSG_NO_LOOKUPS (security vulnerability)
+      ansible.windows.win_shell: |
+        [System.Environment]::SetEnvironmentVariable('LOG4J_FORMAT_MSG_NO_LOOKUPS','true',[System.EnvironmentVariableTarget]::Machine)
+
+    - name: Ensure that MSBuild is on the path
+      ansible.windows.win_path:
+        elements: C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin        
+
+    - name: Create internal Chocolatey repository source
+      win_chocolatey_source:
+        name: internal_repo
+        state: present
+        source: https://nexus.allocate-cloud.co.uk/repository/allocate-nuget-chocolatey/
+        source_username: build-rld
+        source_password: '{{ build_rld_pw }}'
+    
+    - name: Install legacy packages from internal Chocolatey repository
+      chocolatey.chocolatey.win_chocolatey:
+        name: 
+          - asw-nunit
+          - asw-altovaxml
+          - asw-xmlspy
+          - asw-collabnet-subversion
+          - asw-nvspbind
+        source: internal_repo
+
+    - name: Create MSMQ parameters registry path
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\MSMQ\Parameters
+        
+    - name: Add MSMQ MessageCleanupInterval registry key
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\MSMQ\Parameters
+        name: MessageCleanupInterval
+        data: 0x00000fa0
+        type: dword
+        
+    - name: Add MSMQ MulticastRateKbitsPerSec registry key
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\MSMQ\Parameters
+        name: MulticastRateKbitsPerSec
+        data: 0x0000ffff
+        type: dword     
+    
+    - name: Enable long paths
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem
+        name: LongPathsEnabled
+        data: 0x00000001
+        type: dword
+
+    - name: Enable hidden files folder option
+      ansible.windows.win_regedit:
+        path: HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced
+        name: Hidden
+        data: 0x00000001
+        type: dword
+
+    - name: Enable file extensions folder option
+      ansible.windows.win_regedit:
+        path: HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced
+        name: HideFileExt
+        data: 0x00000000
+        type: dword
+
+    - name: Install loopback adapter
+      ansible.windows.win_shell: C:\\ProvisioningFiles\\Powershell\\Create-LoopbackAdapter.ps1
+      
+    - name: Set machine keys
+      ansible.windows.win_shell: C:\\ProvisioningFiles\\Powershell\\Set-MachineKeys.ps1
+      
+    - name: Set IIS anonymous authentication
+      ansible.windows.win_shell: C:\\ProvisioningFiles\\Powershell\\Set-IISAuthIdentity.ps1    
+
+    - name: Install Octopus client dlls
+      ansible.windows.win_shell: | 
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Find-PackageProvider -Name 'Nuget' -ForceBootstrap -IncludeDependencies
+        Register-PackageSource -provider NuGet -Trusted -name nugetRepository -location https://www.nuget.org/api/v2
+        Install-Package Octopus.Client -SkipDependencies
+
+    - name: Install PSCX module for non-zip archives
+      community.windows.win_psmodule:
+        name: Pscx
+        allow_clobber: yes
+        state: present
+
+    - name: Download msvcr71.dll for java localisation from Nexus
+      ansible.windows.win_get_url:
+        url: https://nexus.allocate-cloud.co.uk/repository/allocate-raw/healthroster-msvcr71/msvcr71.dll
+        dest: 'C:\ProvisioningFiles\msvcr71.dll'
+        url_username: build-rld
+        url_password: '{{ build_rld_pw }}'
+
+    - name: Copy msvcr71.dll to System32
+      ansible.windows.win_copy:
+        src: C:\ProvisioningFiles\msvcr71.dll
+        dest: C:\Windows\System32\msvcr71.dll
+        remote_src: yes
+
+    - name: Copy msvcr71.dll to SysWOW64
+      ansible.windows.win_copy:
+        src: C:\ProvisioningFiles\msvcr71.dll
+        dest: C:\Windows\SysWOW64\msvcr71.dll
+        remote_src: yes
+
+    - name: Download sdks from Nexus
+      ansible.windows.win_get_url:
+        url: https://nexus.allocate-cloud.co.uk/repository/allocate-raw/healthroster-sdks/sdks.7z
+        dest: 'C:\ProvisioningFiles\sdks.7z'
+        url_username: build-rld
+        url_password: '{{ build_rld_pw }}'
+
+    - name: Extract sdks .7z file
+      community.windows.win_unzip:
+        src: C:\ProvisioningFiles\sdks.7z
+        dest: C:\build
+        
+    - name: Set an environment variable for all users
+      ansible.windows.win_environment:
+        state: present
+        name: 'JAVA_HOME'
+        value: 'C:\build\sdks\Flex\4.6.0\jre'
+        level: machine
+        
+    - name: Set an environment variable for all users
+      ansible.windows.win_environment:
+        state: present
+        name: 'IDEA_JDK_64'
+        value: 'C:\build\sdks\Java\jdk1.7.0_03'
+        level: machine
+
+    - name: Add a github credential for Administrator
+      community.windows.win_psexec:
+        command: cmdkey.exe /generic:LegacyGeneric:target=git:https://github.com /user:build-allocate /pass:{{ build_github_pat }}
+        interactive: yes
+        hostnames: localhost
+        username: Administrator
+        password: '{{ admin_pw }}'
+
+    - name: Add a github credential for build
+      community.windows.win_psexec:
+        command: cmdkey.exe /generic:LegacyGeneric:target=git:https://github.com /user:build-allocate /pass:{{ build_github_pat }}
+        interactive: yes
+        hostnames: localhost
+        username: build
+        password: '{{ build_pw }}'
+        
+    - name: Create ReferenceRepos directory
+      win_file:
+        path: C:\ReferenceRepos
+        state: directory
+    
+    - name: Clone git reference repositories
+      ansible.windows.win_shell: git clone https://{{ build_github_pat }}@github.com/asw-engineering/healthroster.git
+      args:
+        chdir: C:\ReferenceRepos\
+    
+    - name: Set git configuration
+      ansible.windows.win_shell: |
+        git config --system core.longpaths true
+        git config --system user.email "build@allocatesoftware.com"
+        git config --system user.name "build"
+
+    - name: Add source-svr host entry
+      community.windows.win_hosts:
+        state: present
+        canonical_name: source-svr
+        ip_address: 10.2.110.97
+
+    - name: Set nuget.config
+      ansible.windows.win_shell: |
+        New-Item C:\Users\build\AppData\Roaming\NuGet\ -ItemType:Directory -Force
+        '<configuration></configuration>' | Out-File C:\Users\build\AppData\Roaming\NuGet\Nuget.config
+        nuget sources add `
+        -Name allocate-nuget `
+        -Source https://nexus.allocate-cloud.co.uk/repository/allocate-nuget-releases/ `
+        -Username build `
+        -Password %BUILDPASSWORD% `
+        -ConfigFile C:\Users\build\AppData\Roaming\NuGet\Nuget.config `
+        -StorePasswordInClearText
+    
+    - name: Create HealthRoster app pool with build user
+      community.windows.win_iis_webapppool:
+        name: HealthRosterBUILD
+        state: started
+        attributes:
+          processModel.identityType: SpecificUser
+          processModel.userName: 'build'
+          processModel.password: '{{ build_pw }}'
+          processModel.loadUserProfile: true
+    
+    - name: Create Jenkins directory
+      win_file:
+        path: C:\Jenkins
+        state: directory
+    
+    - name: Download Jenkins agent jar
+      win_get_url:
+        url: http://build.allocate-dev.co.uk/jnlpJars/agent.jar
+        dest: C:\Jenkins          
+    
+    - name: Set unattend.xml autologon password
+      ansible.windows.win_shell: C:\\ProvisioningFiles\\Powershell\\Set-AutoLogonPassword.ps1 -xmlPath "C:\\ProvisioningFiles\\healthroster-w2016-unattend.xml" -password "{{ sysprep_pw }}"
